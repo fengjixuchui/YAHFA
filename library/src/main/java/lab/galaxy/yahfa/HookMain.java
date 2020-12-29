@@ -7,16 +7,22 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.LinkedList;
-import java.util.List;
+import java.lang.reflect.Member;
 
 /**
  * Created by liuruikai756 on 28/03/2017.
  */
 
 public class HookMain {
-    private static final String TAG = "YAHFA";
-    
+    private static final String TAG = HookMain.class.getSimpleName();
+    // isDebugModeEnabledR = BuildConfig.DEBUG;
+    // Ref: http://aosp.opersys.com/xref/android-11.0.0_r17/xref/art/runtime/art_method.cc
+    public static Boolean isDebugModeEnabledR = Boolean.FALSE;
+    public static void setDebugEnabledR(Boolean b)
+    {
+        isDebugModeEnabledR = b;
+    }
+
     static {
         System.loadLibrary("yahfa");
         init(android.os.Build.VERSION.SDK_INT);
@@ -65,6 +71,13 @@ public class HookMain {
                 Log.e(TAG, "Cannot find hook for " + methodName);
                 return;
             }
+
+            // has to visibly init the classes
+            // see the comment for function Utils.initClass()
+            if(Utils.initClass() != 0) {
+                Log.e(TAG, "Utils.initClass failed");
+            }
+
             findAndBackupAndHook(clazz, methodName, methodSig, hook, backup);
         } catch (Exception e) {
             e.printStackTrace();
@@ -88,6 +101,12 @@ public class HookMain {
         if (target == null) {
             throw new IllegalArgumentException("null target method");
         }
+        
+        if(target instanceof Member && Modifier.isStatic(((Member)target).getModifiers()) && isDebugModeEnabledR)
+        {
+            throw new IllegalArgumentException("Debug enabled.");
+        }
+        
         if (hook == null) {
             throw new IllegalArgumentException("null hook method");
         }
@@ -102,6 +121,12 @@ public class HookMain {
             }
             // backup is just a placeholder and the constraint could be less strict
             checkCompatibleMethods(target, backup, "Original", "Backup");
+        }
+
+        // has to visibly init the classes
+        // see the comment for function Utils.initClass()
+        if(Utils.initClass() != 0) {
+            Log.e(TAG, "Utils.initClass failed");
         }
 
         if (!backupAndHookNative(target, hook, backup)) {
@@ -172,4 +197,24 @@ public class HookMain {
     public static native Object findMethodNative(Class targetClass, String methodName, String methodSig);
 
     private static native void init(int sdkVersion);
+
+    public static class Utils {
+        // https://github.com/PAGalaxyLab/YAHFA/pull/133#issuecomment-743728607
+        // class may be visible initialized after it's initialized after Android R
+        // so we have to call MakeInitializedClassesVisiblyInitialized explicitly before hooking
+        public static int initClass() {
+            // do nothing before Android R or on x86 devices
+            if(shouldVisiblyInit()) {
+                long thread = getThread();
+                return visiblyInit(thread);
+            }
+            else {
+                return 0;
+            }
+        }
+
+        private static native boolean shouldVisiblyInit();
+        private static native int visiblyInit(long thread);
+        private static native long getThread();
+    }
 }

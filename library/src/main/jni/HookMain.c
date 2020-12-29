@@ -1,21 +1,29 @@
-#include "jni.h"
-#include <string.h>
+#include <jni.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 
 #include "common.h"
 #include "trampoline.h"
+#include "dlfunc.h"
 
-int SDKVersion;
-static int OFFSET_entry_point_from_interpreter_in_ArtMethod;
-static int OFFSET_entry_point_from_quick_compiled_code_in_ArtMethod;
-static int OFFSET_ArtMehod_in_Object;
-static int OFFSET_access_flags_in_ArtMethod;
-static int kAccNative = 0x0100;
-static int kAccCompileDontBother = 0x01000000;
-static int kAccFastInterpreterToInterpreterInvoke = 0x40000000;
+static int SDKVersion;
+static uint32_t OFFSET_entry_point_from_interpreter_in_ArtMethod;
+static uint32_t OFFSET_entry_point_from_quick_compiled_code_in_ArtMethod;
+static uint32_t OFFSET_ArtMehod_in_Object;
+static uint32_t OFFSET_access_flags_in_ArtMethod;
+static uint32_t kAccNative = 0x0100;
+static uint32_t kAccCompileDontBother = 0x01000000;
+static uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000;
 
+static jfieldID fieldArtMethod = NULL;
+
+static uint32_t OFFSET_classlinker_in_Runtime;
+static char *classLinker = NULL;
+typedef void (*InitClassFunc)(void *, int);
+static InitClassFunc MakeInitializedClassesVisiblyInitialized = NULL;
+static int shouldVisiblyInit();
+static int findInitClassSymbols(JNIEnv *env);
 
 static inline uint32_t read32(void *addr) {
     return *((uint32_t *) addr);
@@ -29,11 +37,112 @@ static inline void *readAddr(void *addr) {
     return *((void **) addr);
 }
 
+static inline void writeAddr(void *addr, void *value) {
+    *((void **)addr) = value;
+}
+
+static int findInitClassSymbols(JNIEnv *env) {
+    if(dlfunc_init(env) != JNI_OK) {
+        LOGE("dlfunc init failed");
+        return 1;
+    }
+    void *handle = dlfunc_dlopen(env, "libart.so", RTLD_LAZY);
+    if(handle == NULL) {
+        LOGE("failed to find libart.so handle");
+        return 1;
+    }
+    else {
+        void **runtime_bss = dlfunc_dlsym(env, handle, "_ZN3art7Runtime9instance_E");
+        if(!runtime_bss) {
+            LOGE("failed to find Runtime::instance symbol");
+            return 1;
+        }
+        char *runtime = *runtime_bss;
+        if(!runtime) {
+            LOGE("Runtime::instance value is NULL");
+            return 1;
+        }
+        classLinker = runtime + OFFSET_classlinker_in_Runtime;
+
+        MakeInitializedClassesVisiblyInitialized =
+                dlfunc_dlsym(env, handle, "_ZN3art11ClassLinker40MakeInitializedClassesVisiblyInitializedEPNS_6ThreadEb");
+        if(!MakeInitializedClassesVisiblyInitialized) {
+            LOGE("failed to find MakeInitializedClassesVisiblyInitialized symbol");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+jlong __attribute__((naked)) Java_lab_galaxy_yahfa_HookMain_00024Utils_getThread(JNIEnv *env, jclass clazz) {
+#if defined(__aarch64__)
+    __asm__(
+            "mov x0, x19\n"
+            "ret\n"
+            );
+#elif defined(__arm__)
+    __asm__(
+            "mov r0, r9\n"
+            "bx lr\n"
+            );
+#elif defined(__x86_64__)
+    __asm__(
+            "mov %gs:0xe8, %rax\n" // offset on Android R
+            "ret\n"
+            );
+#elif defined(__i386__)
+    __asm__(
+            "mov %fs:0xc4, %eax\n" // offset on Android R
+            "ret\n"
+            );
+#endif
+}
+
+static int shouldVisiblyInit() {
+#if defined(__i386__) || defined(__x86_64__)
+    return 0;
+#else
+    if(SDKVersion < __ANDROID_API_R__) {
+        return 0;
+    }
+    else return 1;
+#endif
+}
+
+jboolean Java_lab_galaxy_yahfa_HookMain_00024Utils_shouldVisiblyInit(JNIEnv *env, jclass clazz) {
+    return shouldVisiblyInit() != 0;
+}
+
+jint Java_lab_galaxy_yahfa_HookMain_00024Utils_visiblyInit(JNIEnv *env, jclass clazz, jlong thread) {
+    if(!shouldVisiblyInit()) {
+        return 0;
+    }
+
+    if(!classLinker || !MakeInitializedClassesVisiblyInitialized) {
+        if(findInitClassSymbols(env) != 0) {
+            LOGE("failed to find symbols: classLinker %p, MakeInitializedClassesVisiblyInitialized %p",
+                    classLinker, MakeInitializedClassesVisiblyInitialized);
+            return 1;
+        }
+    }
+
+    MakeInitializedClassesVisiblyInitialized((void *)thread, 1);
+    return 0;
+}
+
 void Java_lab_galaxy_yahfa_HookMain_init(JNIEnv *env, jclass clazz, jint sdkVersion) {
-    int i;
     SDKVersion = sdkVersion;
+    jclass classExecutable;
     LOGI("init to SDK %d", sdkVersion);
     switch (sdkVersion) {
+        case __ANDROID_API_R__:
+            classExecutable = (*env)->FindClass(env, "java/lang/reflect/Executable");
+            fieldArtMethod = (*env)->GetFieldID(env, classExecutable, "artMethod", "J");
+#if defined(__x86_64__) || defined(__aarch64__)
+            OFFSET_classlinker_in_Runtime = 472;
+#else
+            OFFSET_classlinker_in_Runtime = 276;
+#endif
         case __ANDROID_API_Q__:
         case __ANDROID_API_P__:
             kAccCompileDontBother = 0x02000000;
@@ -99,8 +208,8 @@ static void setNonCompilable(void *method) {
     if (SDKVersion < __ANDROID_API_N__) {
         return;
     }
-    int access_flags = getFlags(method);
-    int old_flags = access_flags;
+    uint32_t access_flags = getFlags(method);
+    uint32_t old_flags = access_flags;
     access_flags |= kAccCompileDontBother;
     setFlags(method, access_flags);
     LOGI("setNonCompilable: change access flags from 0x%x to 0x%x", old_flags, access_flags);
@@ -108,15 +217,6 @@ static void setNonCompilable(void *method) {
 }
 
 static int replaceMethod(void *fromMethod, void *toMethod, int isBackup) {
-    if (hookCount >= hookCap) {
-        LOGI("not enough capacity. Allocating...");
-        if (doInitHookCap(DEFAULT_CAP)) {
-            LOGE("cannot hook method");
-            return 1;
-        }
-        LOGI("Allocating done");
-    }
-
     LOGI("replace method from %p to %p", fromMethod, toMethod);
 
     // replace entry point
@@ -136,34 +236,36 @@ static int replaceMethod(void *fromMethod, void *toMethod, int isBackup) {
          newEntrypoint
     );
     if (newEntrypoint) {
-        memcpy((char *) fromMethod + OFFSET_entry_point_from_quick_compiled_code_in_ArtMethod,
-               &newEntrypoint,
-               pointer_size);
+        writeAddr((char *) fromMethod + OFFSET_entry_point_from_quick_compiled_code_in_ArtMethod,
+                newEntrypoint);
     } else {
         LOGE("failed to allocate space for trampoline of target method");
         return 1;
     }
 
     if (OFFSET_entry_point_from_interpreter_in_ArtMethod != 0) {
-        memcpy((char *) fromMethod + OFFSET_entry_point_from_interpreter_in_ArtMethod,
-               (char *) toMethod + OFFSET_entry_point_from_interpreter_in_ArtMethod,
-               pointer_size);
+        void *interpEntrypoint = readAddr((char *) toMethod + OFFSET_entry_point_from_interpreter_in_ArtMethod);
+        writeAddr((char *) fromMethod + OFFSET_entry_point_from_interpreter_in_ArtMethod,
+                interpEntrypoint);
     }
 
     // set the target method to native so that Android O wouldn't invoke it with interpreter
-    if (SDKVersion >= __ANDROID_API_O__) {
-        int access_flags = getFlags(fromMethod);
-        int old_flags = access_flags;
-        access_flags |= kAccNative;
+    if(SDKVersion >= __ANDROID_API_O__) {
+        uint32_t access_flags = getFlags(fromMethod);
+        uint32_t old_flags = access_flags;
         if (SDKVersion >= __ANDROID_API_Q__) {
             // On API 29 whether to use the fast path or not is cached in the ART method structure
             access_flags &= ~kAccFastInterpreterToInterpreterInvoke;
+        }
+        if (SDKVersion <= __ANDROID_API_Q__) {
+            // We don't set kAccNative on R+ because they will try to load from real native method pointer instead of entry_point_from_quick_compiled_code_.
+            // Ref: https://cs.android.com/android/platform/superproject/+/android-11.0.0_r3:art/runtime/art_method.h;l=844;bpv=1;bpt=1
+            access_flags |= kAccNative;
         }
         setFlags(fromMethod, access_flags);
         LOGI("change access flags from 0x%x to 0x%x", old_flags, access_flags);
     }
 
-    hookCount += 1;
     return 0;
 
 }
@@ -194,6 +296,25 @@ static int doBackupAndHook(void *targetMethod, void *hookMethod, void *backupMet
 
     LOGI("hook and backup done");
     return res;
+}
+
+static void *getArtMethod(JNIEnv *env, jobject jmethod) {
+    void *artMethod = NULL;
+
+    if(jmethod == NULL) {
+        return artMethod;
+    }
+
+    if(SDKVersion == __ANDROID_API_R__) {
+        artMethod = (void *) (*env)->GetLongField(env, jmethod, fieldArtMethod);
+    }
+    else {
+        artMethod = (void *) (*env)->FromReflectedMethod(env, jmethod);
+    }
+
+    LOGI("ArtMethod: %p", artMethod);
+    return artMethod;
+
 }
 
 jobject Java_lab_galaxy_yahfa_HookMain_findMethodNative(JNIEnv *env, jclass clazz,
@@ -227,10 +348,12 @@ jboolean Java_lab_galaxy_yahfa_HookMain_backupAndHookNative(JNIEnv *env, jclass 
                                                             jobject target, jobject hook,
                                                             jobject backup) {
 
+
+
     if (!doBackupAndHook(
-            (void *) (*env)->FromReflectedMethod(env, target),
-            (void *) (*env)->FromReflectedMethod(env, hook),
-            backup == NULL ? NULL : (void *) (*env)->FromReflectedMethod(env, backup)
+            getArtMethod(env, target),
+            getArtMethod(env, hook),
+            getArtMethod(env, backup)
     )) {
         (*env)->NewGlobalRef(env, hook); // keep a global ref so that the hook method would not be GCed
         if(backup) (*env)->NewGlobalRef(env, backup);
